@@ -1,0 +1,316 @@
+#!/usr/bin/env ruby
+$stdout.sync = true
+
+def prompt(*args)
+  print(*args)
+  STDIN.gets
+end
+
+def ask(*args)
+  response = prompt(*args)
+  response.downcase!
+  response.strip!
+  response =~ /[jy]|ja|yes/i
+end
+
+def ruby_version
+  @ruby_versions ||= `rbenv install -l | grep -v - | tail -2 | sed -e 's/^ *//'`.split("\n")
+end
+
+# gets the versions for all rails_versions
+def rails_versions
+  @rails_versions ||= gem_versions('rails')
+end
+
+def gem_versions(gem_name)
+  @gem_versions ||= Hash.new
+  return @gem_versions[gem_name] if !@gem_versions[gem_name].nil?
+  puts "Getting versions for #{gem_name}..."
+  versions = `gem list --remote #{gem_name} -a | grep '^#{gem_name} '`
+  versions.gsub!("#{gem_name} (", '')
+  versions.delete!(')')
+  # Map string to array of versions
+  versions = versions.split(',').map(&:strip)
+
+  gem_versions = {}
+
+  while !versions.empty?
+    latest = versions.first
+    minor = latest.split('.')[0..1].join('.')
+    gem_versions[minor] = versions.select { |v| v.start_with?(minor) }
+    versions -= gem_versions[minor]
+  end
+  @gem_versions[gem_name] = gem_versions
+
+  @gem_versions[gem_name]
+end
+
+def previous_to_last_ruby
+  ruby_version[0]
+end
+
+def latest_ruby_version
+  ruby_version[1]
+end
+
+def append_lines(spec_file, lines)
+  require 'fileutils'
+  output_file = "#{spec_file}.tmp"
+  total_lines = File.readlines(spec_file).size
+  i = 0
+  File.open(output_file, 'w') do |out_file|
+    File.foreach(spec_file) do |line|
+      # out_file.puts line unless <put here your condition for removing the line>
+      if i == total_lines
+        out_file.puts line
+        # Here we insert our lines
+        out_file.puts # add a empty line
+        lines.each do |line_2|
+          out_file.puts line_2
+        end
+        out_file.puts # and another empty line
+      else
+        out_file.puts line
+      end
+      i += 1
+    end
+  end
+  FileUtils.mv(output_file, spec_file)
+  puts "Done with #{spec_file}"
+end
+
+# returns false if no replacements were made
+def replace_lines(spec_file, replaces)
+  require 'fileutils'
+  output_file = "#{spec_file}.tmp"
+  content = org_content = File.read(spec_file)
+  replaces.each do |ar_repl|
+    content.gsub!(ar_repl[0], ar_repl[1])
+  end
+  return false if org_content == content
+
+  File.open(output_file, 'w') do |out_file|
+    out_file.puts content
+  end
+  FileUtils.mv(output_file, spec_file)
+  puts "Done with #{spec_file}"
+  true
+end
+
+def replace_file_content(spec_file, content)
+  require 'fileutils'
+  output_file = "#{spec_file}.tmp"
+  File.open(output_file, 'w') do |out_file|
+    File.foreach(spec_file) do |_line|
+      out_file.puts content
+    end
+  end
+  FileUtils.mv(output_file, spec_file)
+  puts "Done with #{spec_file}"
+end
+
+def check_ruby_version_file(path)
+  content = File.read(path.to_s).strip
+  puts "Current ruby version: #{content}"
+  if content == "ruby-#{latest_ruby_version}" || content == "ruby-#{previous_to_last_ruby}"
+    puts 'Good version, no upgrade done'
+    return
+  end
+  if ask "Do you want to install version #{latest_ruby_version}?"
+    new_content = "ruby-#{latest_ruby_version}"
+  elsif ask "Do you want to install version #{previous_to_last_ruby}?"
+    new_content = "ruby-#{previous_to_last_ruby}"
+  else
+    puts 'No install of ruby done!'
+    return
+  end
+  if content != new_content
+    replace_file_content path.to_s, new_content
+  else
+    puts 'The same, not replaced'
+  end
+end
+
+def check_gemfile(path_to_gemfile)
+  content = File.read(path_to_gemfile.to_s)
+  begin
+    rvn = File.read(path_to_gemfile.sub('Gemfile', '.ruby-version').to_s).strip
+  rescue Errno::ENOENT
+    puts 'No ruby version file found.'
+    return
+  end
+
+  req = rvn.split('-').last
+  rg = /ruby [\'\"]#{req}[\'\"]/
+
+  puts "Checking for ruby '#{req}' in #{path_to_gemfile}"
+
+  if content.index(rg).nil?
+    # Not found in file, so we need to put it in the Gemfile
+    replace_regex = /ruby [\'\"].+[\'\"]/
+    replace_lines(path_to_gemfile, [[replace_regex, "ruby '#{req}'"]])
+    # content.gsub!(replace_regex, "ruby '#{req}'")
+    # replace_file_content(, content)
+  else
+    puts "Found, no adjustment needed: #{content.index(rg)}"
+  end
+end
+
+def in_gemfile?(path_to_gemfile, reg)
+  content = File.read(path_to_gemfile.to_s)
+
+  !content.index(reg).nil?
+end
+
+def git?(path)
+  File.exist?("#{path}/.git")
+end
+
+def command_in_path(command, path)
+  return if command.nil? || command.to_s == ''
+  puts "cd #{path} && #{command.strip} && cd -"
+  `cd #{path} && #{command.strip} && cd -`
+end
+
+def work_branch_name
+  @work_branch_name ||= "ruby-upgrade-#{Time.now.strftime('%Y%m%d')}"
+end
+
+def git_branch(path)
+  return unless git?(path)
+  command_in_path("git checkout -b '#{work_branch_name}'", path)
+end
+
+def git_current_branch(path)
+  return unless git?(path)
+  current = `cd #{path} && git rev-parse --abbrev-ref HEAD`
+
+  current
+end
+
+def git_commit(path, msg)
+  return unless git?(path)
+  puts 'Git commiting!'
+  command_in_path('git add .', path)
+  return if git_status_clean?(path)
+  command_in_path("git commit -m '#{msg}'", path)
+end
+
+def git_status_clean?(path)
+  fail "#{path} is not a git repository" unless git?(path)
+  state = command_in_path('git status', path)
+  return true if state.index('nothing to commit, working directory clean') || state.index('nothing added to commit but untracked files present')
+  puts "Git not clean! #{path}, attempting stash!"
+  command_in_path('git stash', path)
+  state = command_in_path('git status', path)
+  return true if state.index('nothing to commit, working directory clean')
+  command_in_path('git stash pop', path)
+  return false
+end
+
+def folders_to_check
+  @folders ||= Dir.glob('./**/.ruby-version')
+end
+
+def update_gem_in_gemfile(g, gemfile_loc)
+  # No need to check for gems not in the Gemfile :-)
+  return unless in_gemfile?(gemfile_loc, /gem [\'\"]#{g}[\'\"]/)
+  puts "Found #{g} in #{gemfile_loc}"
+  updates = []
+  gem_versions(g).each do |major, versions|
+    # this is a hash major = key, value array of versions
+    updates << [/gem [\'\"]#{g}[\'\"], [\'\"].+#{major}.+[\'\"]\n/, "gem '#{g}', '~> #{versions.first}'\n"]
+  end
+  # No version given? Lock at latest
+  latest_ver = gem_versions(g).values.first.first
+
+  if in_gemfile?(gemfile_loc, /gem [\'\"]#{g}[\'\"], '~> #{latest_ver}'/) || in_gemfile?(gemfile_loc, /gem [\'\"]#{g}[\'\"], '#{latest_ver}'/)
+    puts "Already latest version, skipping upgrade of #{g}"
+    return
+  end
+
+  updates << [/gem [\'\"]#{g}[\'\"]/, "gem '#{g}', '~> #{latest_ver}'\n"]
+  if replace_lines(gemfile_loc, updates)
+    command_in_path("bundle update #{g}", path)
+    git_commit(path, "Updated #{g} to latest version")
+  end
+end
+
+def check_folders
+  puts 'Installing ruby versions, this can take time!'
+  ruby_version.each do |ver|
+    puts "Install #{ver} if missing..."
+    `rbenv install -s #{ver}`
+  end
+  folders_to_check.each do |file|
+    path = file.gsub('.ruby-version', '')
+    if git_status_clean?(path)
+      puts "Checking #{path}"
+      current_branch = git_current_branch(path).strip
+      puts "Current branch: #{current_branch}"
+      puts "Target branch: #{work_branch_name}"
+      if current_branch == work_branch_name
+        puts "Current branch matches #{work_branch_name}"
+        puts "Default to master"
+        current_branch = 'master'
+      else
+        git_branch(path)
+      end
+      check_ruby_version_file file
+      gemfile_loc = "#{path}Gemfile"
+      puts "Checking Gemfile (#{gemfile_loc}) for correct ruby version"
+      check_gemfile gemfile_loc
+      puts "Installing gems for #{path}"
+      `cd #{path} && bundle install --quiet`
+      git_commit(path, 'Updated ruby version and installed gems')
+      puts 'Secure the rails gem'
+      update_gem_in_gemfile('rails', gemfile_loc)
+
+      # Replace cancan by cancancan
+      latest_ver = gem_versions('cancancan').values.first.first
+      updates = [
+        [/gem [\'\"]cancan[\'\"].+/, "gem 'cancancan', '~> #{latest_ver}'\n"]
+      ]
+      if replace_lines(gemfile_loc, updates)
+        command_in_path("bundle install", path)
+        git_commit(path, "Replaced cancan with cancancan")
+      end
+      # Secure other gems if found
+      gems = %w(
+      devise 
+      cancancan 
+      rmagick 
+      rspec 
+      unicorn 
+      thin 
+      puma 
+      rspec-rails 
+      nokogiri
+      will_paginate
+      ransack
+      simple_form
+      )
+      gems.each do |g|
+        update_gem_in_gemfile(g, gemfile_loc)
+      end
+
+      command_in_path("git checkout #{current_branch}", path)
+
+      puts command_in_path("git merge #{work_branch_name} --stat", path)
+      puts command_in_path("git branch -d #{work_branch_name}", path)
+
+      command_in_path('git stash pop', path)
+      puts command_in_path('git status', path)
+      command_in_path('git gc', path)
+    else
+      puts "This isn't clean, or not a git repo! #{path}"
+    end
+  end
+  puts "All done, you're welcome!"
+end
+
+puts 'Welcome! This script will attempt to upgrade your ruby projects'
+puts 'to the latest ruby version'
+if ask "We found #{folders_to_check.size} Projects here.\nContinue with upgrade?"
+  check_folders
+end

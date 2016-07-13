@@ -1,0 +1,176 @@
+#!/usr/bin/env ruby
+$stdout.sync = true
+
+def prompt(*args)
+    print(*args)
+    STDIN.gets
+end
+
+def ask(*args)
+  response = prompt(*args)
+  response.downcase!
+  response.strip!
+  return response =~ /[jy]|ja|yes/i
+end
+
+def ask_overwrite(file)
+  file_exists = File.exists?(file)
+  if file_exists == true
+    return ask "File #{file} exists. Overwrite? (y/N)"
+  end
+  return true
+end
+
+def generate_specs
+  files = Dir.glob('./app/models/**/*.rb')
+  files.each do |f|
+    name = f.gsub('./app/models/', '')
+    folder = nil
+    if name.index('/')
+      folder, name = name.split('/')
+      folder = "#{folder}/"
+    end
+    name = name.gsub('.rb','')
+    
+    puts "Printing spec for #{name.camelize}"
+      m = name.camelize.constantize
+      if m.respond_to?(:descends_from_active_record?) == false || m.descends_from_active_record? == false
+        puts "#{name} is not a ActiveRecord descend! Skipping!"
+        next
+      end
+      specfile = []
+      begin  
+        if m.reflections
+          # specfile << " # The relations..."
+          # specfile << " describe 'relations' do"
+          m.reflections.each{|key, val|
+            #assoc kind e.d.
+            assoc = m.reflections[key]
+            if assoc.macro == :has_many
+              specfile << "  it { should have_many(:#{key})#{val.options && val.options[:dependent] ? ".dependent(:#{val.options[:dependent]})" : '' }#{val.options && val.options[:through] ? ".through(:#{val.options[:through]})" : '' } }"
+            end
+            if assoc.macro == :belongs_to
+              specfile << "  it { should belong_to(:#{key}) }"
+            end
+            if assoc.macro == :has_and_belongs_to_many
+              specfile << "  it { should have_and_belong_to_many(:#{key}) }"
+            end
+            if assoc.macro == :has_one
+              specfile << "  it { should have_one(:#{key}) }"
+            end
+          }
+        end
+        # specfile << " end"
+        if m.validators
+          # specfile << "\n # The validations. If any."
+          # specfile << " describe 'validations' do"
+          m.validators.each do |val|
+            if val.class == ActiveModel::Validations::PresenceValidator
+              val.attributes.each do |at|
+                specfile << "  it { should validate_presence_of(:#{at}) }"
+              end
+            end
+            if val.class == ActiveRecord::Validations::UniquenessValidator
+              val.attributes.each do |at|
+                # specfile << "  subject { FactoryGirl.build(:#{name}) }"
+                scope = ".scoped_to(#{val.options[:scope]})" if val.options[:scope]
+                cas = ".case_insensitive" if val.options[:case_sensitive]
+                specfile << "  it { should validate_uniqueness_of(:#{at})#{scope}#{cas} }"
+              end
+            end
+            if val.class == ActiveModel::Validations::ConfirmationValidator
+              val.attributes.each do |at|
+                specfile << "  it { should validate_acceptance_of(:#{at}) }"
+              end
+            end
+          end
+        end
+        # specfile << " end"
+
+        # specfile << "\n # See to the correct use of the DB..."
+        # specfile << " describe 'raw table' do\n"
+        # #Best practices!
+        m.attribute_names.each do |att|
+          # specfile << "  it { should have_db_column(:#{att}) }"
+          if att.ends_with?("_id")
+            specfile << "  it { should have_db_index(:#{att}) }"
+          end
+          if att.end_with?("_type") && !att.end_with?('content_type')
+            specfile << "  it { should have_db_index([:#{att.gsub('_type', '_id')}, :#{att}]) }"
+          end
+        end
+        # specfile << "\n end"
+      rescue
+        puts "There was an error while proccessing #{name.camelize}. Maybe not a ActiveRecord::Base desendent?"
+        puts "The error was: #{$!.inspect}"
+      ensure
+        check_spec("./spec/models/#{folder}#{name}_spec.rb", specfile, name.camelize)
+      end
+  end
+end
+
+def check_spec(spec_file, lines, model)
+  puts "Checking #{spec_file}..."
+  if lines.nil? || lines.size == 0
+    return 'No lines to add...'
+  end
+  if File.exists?(spec_file)
+    spec_lines = File.readlines(spec_file)
+    spec_lines = spec_lines.map(&:strip!)
+    lines = lines.map(&:strip!)
+    need_add = []
+    lines.each do |line|
+      puts "Searching: #{line}"
+      puts "Found? #{spec_lines.find { |n| /#{line}/i =~ n }}"
+      need_add << line unless spec_lines.find { |n| /#{line}/i =~ n }
+    end
+    if need_add.size == 0
+      puts "All #{lines.size} are already added."
+    else
+      puts "Adding #{need_add.size} lines."
+      append_lines(spec_file, need_add)
+    end
+  else
+    #if ask('Spec does not exist, want me to create it? (y/N)')
+      f = File.open(spec_file, "w") { |file| 
+        file.puts "require 'rails_helper'"
+        file.puts "describe #{model} do"
+        file.puts ""
+      }
+      append_lines(spec_file, lines, false)
+      f = File.open(spec_file, "a") { |file| 
+        file.puts "end"
+      }
+    # end
+  end
+end
+
+def append_lines(spec_file, lines, seek = true)
+  require 'fileutils'
+  output_file = "#{spec_file}.tmp"
+  total_lines = File.readlines(spec_file).size
+  i = 0
+  File.open(output_file, "w") do |out_file|
+    File.foreach(spec_file) do |line|
+      #out_file.puts line unless <put here your condition for removing the line>
+      if i == total_lines - 2
+        out_file.puts line
+        # Here we insert our lines
+        out_file.puts # add a empty line
+        lines.each do |line|
+          out_file.puts line
+        end
+        out_file.puts # and another empty line
+      else
+        out_file.puts line
+      end
+      i = i + 1
+    end
+  end
+  FileUtils.mv(output_file, spec_file)
+  puts "Done with #{spec_file}"
+end
+
+# Generate factories and specs
+require './config/environment.rb'
+generate_specs

@@ -1,0 +1,8 @@
+git checkout -b rubocop
+gem install rubocop rubocop-rspec fuubar -Nq
+cp ~/.rubocop.default .rubocop.yml
+rubocop -D -S -R -a -C true --format=fuubar --auto-gen-config
+git add .
+git commit -m 'First pass Rubocop AutoFix!'
+echo 'First pass done, result commited.'
+echo 'Review .rubocop_todo'
